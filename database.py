@@ -1,9 +1,4 @@
-"""Persistenza SQLite per i webhook creati dal bot.
-
-Nel database NON viene mai salvato il token dei webhook: il bot lo ottiene da Discord
-(grazie al permesso Gestisci webhook) solo nel momento in cui serve e lo tiene in memoria.
-Qui si salvano soltanto identificativo, server, canale, nome e qualche metadato.
-"""
+"""Persistenza SQLite per webhook e impostazioni del bot."""
 from __future__ import annotations
 
 import asyncio
@@ -38,8 +33,47 @@ CREATE TABLE IF NOT EXISTS guild_settings (
     log_channel INTEGER,
     created_at  TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS registry_preferences (
+    guild_id          INTEGER PRIMARY KEY,
+    members           INTEGER NOT NULL DEFAULT 1,
+    nicknames         INTEGER NOT NULL DEFAULT 1,
+    roles             INTEGER NOT NULL DEFAULT 1,
+    messages_deleted  INTEGER NOT NULL DEFAULT 1,
+    messages_edited   INTEGER NOT NULL DEFAULT 1,
+    channels          INTEGER NOT NULL DEFAULT 1,
+    moderation        INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS welcome_settings (
+    guild_id INTEGER PRIMARY KEY,
+    welcome_channel INTEGER,
+    leave_channel INTEGER,
+
+    welcome_title TEXT DEFAULT '✨ Nuovo membro!',
+    welcome_description TEXT DEFAULT 'Benvenuto/a {user} in {server}!',
+    welcome_color TEXT DEFAULT '#9966FF',
+    welcome_image TEXT DEFAULT '',
+    welcome_footer TEXT DEFAULT 'Benvenuto',
+
+    leave_title TEXT DEFAULT '👋 Arrivederci!',
+    leave_description TEXT DEFAULT '{username} ha lasciato {server}.',
+    leave_color TEXT DEFAULT '#ED5565',
+    leave_image TEXT DEFAULT '',
+    leave_footer TEXT DEFAULT 'Uscita'
+);
 """
 
+
+REGISTRY_OPTIONS = {
+    "members",
+    "nicknames",
+    "roles",
+    "messages_deleted",
+    "messages_edited",
+    "channels",
+    "moderation",
+}
 
 
 @dataclass(frozen=True)
@@ -66,7 +100,7 @@ def _to_record(row: sqlite3.Row) -> WebhookRecord:
 
 
 class Database:
-    """Wrapper asincrono (thread + lock) attorno a una connessione SQLite."""
+    """Wrapper asincrono (thread + lock) attorno a SQLite."""
 
     def __init__(self, path: Path) -> None:
         self._path = Path(path)
@@ -82,6 +116,35 @@ class Database:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(SCHEMA)
+
+        # Aggiornamento automatico dei database già esistenti.
+        columns = {
+            "welcome_title": "TEXT DEFAULT '✨ Nuovo membro!'",
+            "welcome_description": "TEXT DEFAULT 'Benvenuto/a {user} in {server}!'",
+            "welcome_color": "TEXT DEFAULT '#9966FF'",
+            "welcome_image": "TEXT DEFAULT ''",
+            "welcome_footer": "TEXT DEFAULT 'Benvenuto'",
+            "leave_title": "TEXT DEFAULT '👋 Arrivederci!'",
+            "leave_description": "TEXT DEFAULT '{username} ha lasciato {server}.'",
+            "leave_color": "TEXT DEFAULT '#ED5565'",
+            "leave_image": "TEXT DEFAULT ''",
+            "leave_footer": "TEXT DEFAULT 'Uscita'",
+        }
+
+        existing = {
+            row["name"]
+            for row in conn.execute(
+                "PRAGMA table_info(welcome_settings)"
+            ).fetchall()
+        }
+
+        for column, definition in columns.items():
+            if column not in existing:
+                conn.execute(
+                    f"ALTER TABLE welcome_settings "
+                    f"ADD COLUMN {column} {definition}"
+                )
+
         conn.commit()
         self._conn = conn
 
@@ -93,10 +156,11 @@ class Database:
     async def _run(self, func: Callable[[sqlite3.Connection], T]) -> T:
         if self._conn is None:
             raise RuntimeError("Database non inizializzato.")
+
         async with self._lock:
             return await asyncio.to_thread(func, self._conn)
 
-    # ------------------------------------------------------------------ scrittura
+    # -------------------- WEBHOOK: SCRITTURA --------------------
 
     async def add_webhook(
         self,
@@ -112,10 +176,21 @@ class Database:
 
         def op(conn: sqlite3.Connection) -> None:
             conn.execute(
-                "INSERT OR REPLACE INTO webhooks "
-                "(webhook_id, guild_id, channel_id, name, custom_avatar, created_by, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (webhook_id, guild_id, channel_id, name, int(custom_avatar), created_by, created_at),
+                """
+                INSERT OR REPLACE INTO webhooks
+                (webhook_id, guild_id, channel_id, name,
+                 custom_avatar, created_by, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    webhook_id,
+                    guild_id,
+                    channel_id,
+                    name,
+                    int(custom_avatar),
+                    created_by,
+                    created_at,
+                ),
             )
             conn.commit()
 
@@ -123,7 +198,10 @@ class Database:
 
     async def remove_webhook(self, webhook_id: int) -> bool:
         def op(conn: sqlite3.Connection) -> bool:
-            cur = conn.execute("DELETE FROM webhooks WHERE webhook_id = ?", (webhook_id,))
+            cur = conn.execute(
+                "DELETE FROM webhooks WHERE webhook_id = ?",
+                (webhook_id,),
+            )
             conn.commit()
             return cur.rowcount > 0
 
@@ -131,7 +209,10 @@ class Database:
 
     async def remove_by_channel(self, channel_id: int) -> int:
         def op(conn: sqlite3.Connection) -> int:
-            cur = conn.execute("DELETE FROM webhooks WHERE channel_id = ?", (channel_id,))
+            cur = conn.execute(
+                "DELETE FROM webhooks WHERE channel_id = ?",
+                (channel_id,),
+            )
             conn.commit()
             return cur.rowcount
 
@@ -139,68 +220,95 @@ class Database:
 
     async def remove_guild(self, guild_id: int) -> int:
         def op(conn: sqlite3.Connection) -> int:
-            cur = conn.execute("DELETE FROM webhooks WHERE guild_id = ?", (guild_id,))
+            cur = conn.execute(
+                "DELETE FROM webhooks WHERE guild_id = ?",
+                (guild_id,),
+            )
             conn.commit()
             return cur.rowcount
 
         return await self._run(op)
 
-    # ------------------------------------------------------------------ lettura
+    # -------------------- WEBHOOK: LETTURA --------------------
 
-    async def get_webhook(self, guild_id: int, webhook_id: int) -> Optional[WebhookRecord]:
-        """Restituisce il webhook solo se appartiene al server indicato."""
-
+    async def get_webhook(
+        self,
+        guild_id: int,
+        webhook_id: int,
+    ) -> Optional[WebhookRecord]:
         def op(conn: sqlite3.Connection) -> Optional[WebhookRecord]:
             row = conn.execute(
-                "SELECT * FROM webhooks WHERE webhook_id = ? AND guild_id = ?",
+                """
+                SELECT * FROM webhooks
+                WHERE webhook_id = ? AND guild_id = ?
+                """,
                 (webhook_id, guild_id),
             ).fetchone()
+
             return _to_record(row) if row else None
 
         return await self._run(op)
 
-    async def find_by_name(self, guild_id: int, name: str) -> List[WebhookRecord]:
+    async def find_by_name(
+        self,
+        guild_id: int,
+        name: str,
+    ) -> List[WebhookRecord]:
         def op(conn: sqlite3.Connection) -> List[WebhookRecord]:
             rows = conn.execute(
-                "SELECT * FROM webhooks WHERE guild_id = ? AND name = ? COLLATE NOCASE",
+                """
+                SELECT * FROM webhooks
+                WHERE guild_id = ? AND name = ? COLLATE NOCASE
+                """,
                 (guild_id, name),
             ).fetchall()
-            return [_to_record(r) for r in rows]
+
+            return [_to_record(row) for row in rows]
 
         return await self._run(op)
 
     async def list_webhooks(self, guild_id: int) -> List[WebhookRecord]:
         def op(conn: sqlite3.Connection) -> List[WebhookRecord]:
             rows = conn.execute(
-                "SELECT * FROM webhooks WHERE guild_id = ? ORDER BY name COLLATE NOCASE, webhook_id",
+                """
+                SELECT * FROM webhooks
+                WHERE guild_id = ?
+                ORDER BY name COLLATE NOCASE, webhook_id
+                """,
                 (guild_id,),
             ).fetchall()
-            return [_to_record(r) for r in rows]
+
+            return [_to_record(row) for row in rows]
 
         return await self._run(op)
 
-    async def list_by_channel(self, channel_id: int) -> List[WebhookRecord]:
+    async def list_by_channel(
+        self,
+        channel_id: int,
+    ) -> List[WebhookRecord]:
         def op(conn: sqlite3.Connection) -> List[WebhookRecord]:
             rows = conn.execute(
-                "SELECT * FROM webhooks WHERE channel_id = ?", (channel_id,)
+                "SELECT * FROM webhooks WHERE channel_id = ?",
+                (channel_id,),
             ).fetchall()
-            return [_to_record(r) for r in rows]
+
+            return [_to_record(row) for row in rows]
 
         return await self._run(op)
 
-    # ------------------------------------------------------------
-    # CONFIGURAZIONE SERVER
-    # ------------------------------------------------------------
+    # -------------------- CONFIGURAZIONE SERVER --------------------
 
     async def get_guild_settings(self, guild_id: int) -> dict:
         def op(conn: sqlite3.Connection) -> dict:
             row = conn.execute(
                 "SELECT * FROM guild_settings WHERE guild_id = ?",
-                (guild_id,)
+                (guild_id,),
             ).fetchone()
 
             if row is None:
-                created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                created_at = datetime.now(
+                    timezone.utc
+                ).isoformat(timespec="seconds")
 
                 conn.execute(
                     """
@@ -208,7 +316,7 @@ class Database:
                     (guild_id, prefix, log_channel, created_at)
                     VALUES (?, ?, ?, ?)
                     """,
-                    (guild_id, "!", None, created_at)
+                    (guild_id, "!", None, created_at),
                 )
                 conn.commit()
 
@@ -223,25 +331,212 @@ class Database:
 
         return await self._run(op)
 
-    async def update_guild_prefix(self, guild_id: int, prefix: str) -> None:
+    async def update_guild_prefix(
+        self,
+        guild_id: int,
+        prefix: str,
+    ) -> None:
         await self.get_guild_settings(guild_id)
 
         def op(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "UPDATE guild_settings SET prefix = ? WHERE guild_id = ?",
-                (prefix, guild_id)
+                (prefix, guild_id),
             )
             conn.commit()
 
         await self._run(op)
 
-    async def update_log_channel(self, guild_id: int, channel_id: int | None) -> None:
+    async def update_log_channel(
+        self,
+        guild_id: int,
+        channel_id: int | None,
+    ) -> None:
         await self.get_guild_settings(guild_id)
 
         def op(conn: sqlite3.Connection) -> None:
             conn.execute(
-                "UPDATE guild_settings SET log_channel = ? WHERE guild_id = ?",
-                (channel_id, guild_id)
+                """
+                UPDATE guild_settings
+                SET log_channel = ?
+                WHERE guild_id = ?
+                """,
+                (channel_id, guild_id),
+            )
+            conn.commit()
+
+        await self._run(op)
+
+    # -------------------- PREFERENZE REGISTRI --------------------
+
+    async def get_registry_preferences(self, guild_id: int) -> dict:
+        def op(conn: sqlite3.Connection) -> dict:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO registry_preferences (guild_id)
+                VALUES (?)
+                """,
+                (guild_id,),
+            )
+            conn.commit()
+
+            row = conn.execute(
+                """
+                SELECT * FROM registry_preferences
+                WHERE guild_id = ?
+                """,
+                (guild_id,),
+            ).fetchone()
+
+            return {
+                key: bool(value) if key != "guild_id" else value
+                for key, value in dict(row).items()
+            }
+
+        return await self._run(op)
+
+    async def update_registry_preference(
+        self,
+        guild_id: int,
+        option: str,
+        enabled: bool,
+    ) -> None:
+        if option not in REGISTRY_OPTIONS:
+            raise ValueError("Opzione registro non valida.")
+
+        await self.get_registry_preferences(guild_id)
+
+        def op(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                f"""
+                UPDATE registry_preferences
+                SET {option} = ?
+                WHERE guild_id = ?
+                """,
+                (int(enabled), guild_id),
+            )
+            conn.commit()
+
+        await self._run(op)
+
+    # -------------------- MESSAGGI ENTRATA E USCITA --------------------
+
+    async def get_welcome_settings(self, guild_id: int) -> dict:
+        def op(conn: sqlite3.Connection) -> dict:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO welcome_settings (guild_id)
+                VALUES (?)
+                """,
+                (guild_id,),
+            )
+            conn.commit()
+
+            row = conn.execute(
+                """
+                SELECT * FROM welcome_settings
+                WHERE guild_id = ?
+                """,
+                (guild_id,),
+            ).fetchone()
+
+            return dict(row)
+
+        return await self._run(op)
+
+    async def update_welcome_channel(
+        self,
+        guild_id: int,
+        channel_type: str,
+        channel_id: int | None,
+    ) -> None:
+        columns = {
+            "welcome": "welcome_channel",
+            "leave": "leave_channel",
+        }
+
+        if channel_type not in columns:
+            raise ValueError("Tipo di canale non valido.")
+
+        await self.get_welcome_settings(guild_id)
+
+        column = columns[channel_type]
+
+        def op(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                f"""
+                UPDATE welcome_settings
+                SET {column} = ?
+                WHERE guild_id = ?
+                """,
+                (channel_id, guild_id),
+            )
+            conn.commit()
+
+        await self._run(op)
+
+    # -------------------- PERSONALIZZAZIONE MESSAGGI --------------------
+
+    async def update_welcome_message(
+        self,
+        guild_id: int,
+        message_type: str,
+        *,
+        title: str,
+        description: str,
+        color: str,
+        image: str = "",
+        footer: str = "",
+    ) -> None:
+        columns = {
+            "welcome": (
+                "welcome_title",
+                "welcome_description",
+                "welcome_color",
+                "welcome_image",
+                "welcome_footer",
+            ),
+            "leave": (
+                "leave_title",
+                "leave_description",
+                "leave_color",
+                "leave_image",
+                "leave_footer",
+            ),
+        }
+
+        if message_type not in columns:
+            raise ValueError("Tipo di messaggio non valido.")
+
+        await self.get_welcome_settings(guild_id)
+
+        (
+            title_column,
+            description_column,
+            color_column,
+            image_column,
+            footer_column,
+        ) = columns[message_type]
+
+        def op(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                f"""
+                UPDATE welcome_settings
+                SET {title_column} = ?,
+                    {description_column} = ?,
+                    {color_column} = ?,
+                    {image_column} = ?,
+                    {footer_column} = ?
+                WHERE guild_id = ?
+                """,
+                (
+                    title,
+                    description,
+                    color,
+                    image,
+                    footer,
+                    guild_id,
+                ),
             )
             conn.commit()
 
